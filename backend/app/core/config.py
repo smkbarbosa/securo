@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # Set explicitly only when the URL registered in the provider dashboard
     # differs from where the app is served.
     pluggy_oauth_redirect_uri: str = ""
+    # Shared secret for validating incoming Pluggy webhooks. When set, the
+    # endpoint requires a matching `x-pluggy-webhook-secret` header. Leave
+    # empty to accept webhooks without validation (not recommended).
+    pluggy_webhook_secret: str = ""
 
     # Enable Banking (European PSD2 banks)
     enable_banking_app_id: str = ""

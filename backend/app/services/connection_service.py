@@ -862,6 +862,28 @@ async def get_connection(
     return result.scalar_one_or_none()
 
 
+async def get_pending_connection_by_provider_item(
+    session: AsyncSession, provider: str, external_id: str
+) -> Optional[BankConnection]:
+    """Resolve a pending BankConnection by provider item id (e.g. Pluggy itemId).
+
+    Used by provider webhooks (item/created, item/updated, item/error) that
+    arrive before the OAuth flow stores its own copy of the item id, and by
+    background sync workers. Matches strictly on provider + external_id.
+    """
+    if not external_id:
+        return None
+    result = await session.execute(
+        select(BankConnection)
+        .where(
+            BankConnection.provider == provider,
+            BankConnection.external_id == external_id,
+        )
+        .options(selectinload(BankConnection.accounts))
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_oauth_url(
     provider_name: str,
     user_id: uuid.UUID,
