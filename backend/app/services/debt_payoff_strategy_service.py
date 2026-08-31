@@ -106,14 +106,33 @@ def _order(sims: list[_SimDebt], method: str) -> list[_SimDebt]:
 async def compute_payoff_projection(
     session: AsyncSession, workspace_id: uuid.UUID
 ) -> DebtPayoffProjection:
+    """Projection using the workspace's persisted strategy choice."""
     setting = await get_or_create_strategy_setting(session, workspace_id)
+    return await simulate_payoff(
+        session, workspace_id, setting.method, setting.extra_monthly_amount
+    )
+
+
+async def simulate_payoff(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    method: str,
+    extra_monthly_amount: Decimal,
+) -> DebtPayoffProjection:
+    """Projection for a hypothetical method/extra-payment pair.
+
+    Never reads or writes `DebtStrategySetting` — used both by
+    `compute_payoff_projection` (the persisted choice) and by callers
+    (e.g. the debt-analysis MCP tool) comparing what-if scenarios
+    without committing to one.
+    """
     sims = await _active_sim_debts(session, workspace_id)
-    ordered = _order(sims, setting.method)
+    ordered = _order(sims, method)
 
     month = 0
     while any(s.balance > 0 for s in ordered) and month < MAX_MONTHS:
         month += 1
-        extra_available = setting.extra_monthly_amount
+        extra_available = extra_monthly_amount
         for sim in ordered:
             if sim.balance <= 0:
                 continue
@@ -147,8 +166,8 @@ async def compute_payoff_projection(
     finished = [s.months_to_payoff for s in ordered if s.months_to_payoff is not None]
     overall_months = max(finished) if finished and len(finished) == len(ordered) else None
     return DebtPayoffProjection(
-        method=setting.method,
-        extra_monthly_amount=setting.extra_monthly_amount,
+        method=method,
+        extra_monthly_amount=extra_monthly_amount,
         order=entries,
         overall_payoff_date=_advance_date_months(today, overall_months) if overall_months else None,
     )

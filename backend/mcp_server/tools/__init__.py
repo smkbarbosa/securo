@@ -7,6 +7,7 @@ from mcp_server.tools import (  # noqa: F401
     categories,
     payees,
     budgets,
+    debts,
     reports,
     search,
     aggregate,

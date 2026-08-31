@@ -29,6 +29,7 @@ from app.models.recurring_transaction import RecurringTransaction
 from app.models.transaction import Transaction
 from app.schemas.budget import BudgetCreate
 from app.schemas.category import CategoryCreate
+from app.schemas.debt import DebtStrategySettingUpdate
 from app.schemas.goal import GoalCreate
 from app.schemas.recurring_transaction import (
     RecurringTransactionCreate,
@@ -41,6 +42,8 @@ from app.schemas.transaction_split import TransactionSplitInput, TransactionSpli
 from app.services import (
     budget_service,
     category_service,
+    debt_payoff_strategy_service,
+    debt_service,
     goal_service,
     recurring_transaction_service,
     rule_service,
@@ -1096,6 +1099,151 @@ async def propose_create_payee_rule(
                 conditions_op="and",
                 conditions=[RuleCondition(field="description", op="contains", value=match_pattern)],
                 actions=[RuleAction(op="set_category", value=str(cat.id))],
+            ),
+        )
+        return {**preview, "applied": True, "id": str(created.id)}
+
+    return preview
+
+
+@tool(
+    name="propose_debt_payoff_strategy",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Set the workspace's debt payoff strategy: which method orders active "
+        "debts (snowball = smallest balance first, avalanche = highest interest "
+        "rate first) and how much extra to pay toward the top debt each month. "
+        "Call analyze_debt_payoff first to size a realistic extra_monthly_amount "
+        "from the user's actual income/expense history."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "method": {"type": "string", "enum": ["snowball", "avalanche"]},
+            "extra_monthly_amount": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Extra amount applied each month to the top-priority manual-collection debt.",
+            },
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["method", "extra_monthly_amount"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "debts"],
+)
+async def propose_debt_payoff_strategy(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    method: str,
+    extra_monthly_amount: float,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    current = await debt_payoff_strategy_service.get_or_create_strategy_setting(session, ws_id)
+    resolved_extra = Decimal(str(extra_monthly_amount))
+    projection = await debt_payoff_strategy_service.simulate_payoff(
+        session, ws_id, method, resolved_extra
+    )
+
+    preview = {
+        "kind": "update_debt_strategy",
+        "current": {
+            "method": current.method,
+            "extra_monthly_amount": num(current.extra_monthly_amount),
+        },
+        "proposed": {"method": method, "extra_monthly_amount": float(extra_monthly_amount)},
+        "projection": projection.model_dump(mode="json"),
+        "apply_endpoint": "PATCH /api/debts/strategy-setting",
+    }
+
+    if _can_apply(ctx, apply):
+        await debt_payoff_strategy_service.update_strategy_setting(
+            session,
+            ws_id,
+            DebtStrategySettingUpdate(method=method, extra_monthly_amount=resolved_extra),
+        )
+        return {**preview, "applied": True}
+
+    return preview
+
+
+@tool(
+    name="propose_debt_reserve_goal",
+    description=_PROPOSAL_PREFACE
+    + (
+        "Preview a savings goal that sets money aside toward negotiating a "
+        "lump-sum settlement for one debt, instead of paying it down via "
+        "regular installments — a common alternative for a debt already "
+        "in 'negotiating' status or one small enough to pay off in one shot. "
+        "Defaults the target to the debt's current balance; pass a lower "
+        "target_amount if you expect a settlement discount."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "debt_id": {"type": "string", "format": "uuid"},
+            "target_amount": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Defaults to the debt's current balance.",
+            },
+            "apply": _APPLY_FIELD,
+        },
+        "required": ["debt_id"],
+        "additionalProperties": False,
+    },
+    is_proposal=True,
+    tags=["propose", "debts", "goals"],
+)
+async def propose_debt_reserve_goal(
+    *,
+    session: AsyncSession,
+    ctx: CallContext,
+    debt_id: str,
+    target_amount: float | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    ws_id = await resolve_workspace_id(session, ctx)
+    parsed_debt_id = parse_uuid(debt_id)
+    debt = await debt_service.get_debt(session, parsed_debt_id, ws_id) if parsed_debt_id else None
+    if debt is None:
+        return {"error": "debt not found"}
+
+    resolved_target = Decimal(str(target_amount)) if target_amount is not None else debt.current_balance
+    name = f"Quitação — {debt.creditor_name}"
+
+    preview = {
+        "kind": "create_debt_reserve_goal",
+        "proposed": {
+            "name": name,
+            "target_amount": num(resolved_target),
+            "currency": debt.currency,
+            "tracking_type": "manual",
+        },
+        "note": (
+            "This goal only tracks savings toward the lump sum — it doesn't "
+            "touch the debt record itself. Mark the debt 'negotiating' and, "
+            "once settled, record the payoff on its active installment(s) "
+            "separately."
+        ),
+        "apply_endpoint": "POST /api/goals",
+    }
+
+    if _can_apply(ctx, apply):
+        created = await goal_service.create_goal(
+            session,
+            ws_id,
+            ctx.user_id,
+            GoalCreate(
+                name=name,
+                target_amount=resolved_target,
+                current_amount=Decimal("0"),
+                currency=debt.currency,
+                icon="piggy-bank",
+                color="#8B5CF6",
             ),
         )
         return {**preview, "applied": True, "id": str(created.id)}

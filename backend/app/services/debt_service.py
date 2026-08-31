@@ -59,6 +59,10 @@ async def get_debts(session: AsyncSession, workspace_id: uuid.UUID) -> list[Debt
         .where(Debt.workspace_id == workspace_id)
         .options(selectinload(Debt.plans).selectinload(DebtPlan.installments))
         .order_by(Debt.status, Debt.opened_date.desc())
+        # See get_debt(): without this, a debt fetched earlier in the same
+        # session (e.g. before its plan existed) would keep a stale, empty
+        # `plans` collection instead of picking up what's since been added.
+        .execution_options(populate_existing=True)
     )
     return list(result.scalars().all())
 

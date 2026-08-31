@@ -56,6 +56,10 @@ def test_registry_contains_v1_tools():
         "list_recurring_transactions",
         "list_assets",
         "list_goals",
+        "list_debts",
+        "analyze_debt_payoff",
+        "propose_debt_payoff_strategy",
+        "propose_debt_reserve_goal",
     }
     assert expected.issubset(set(REGISTRY.keys())), (
         f"missing: {expected - set(REGISTRY.keys())}"
@@ -63,7 +67,14 @@ def test_registry_contains_v1_tools():
 
 
 def test_proposal_tools_marked_is_proposal():
-    for name in ("propose_categorize", "propose_create_category", "propose_create_budget", "propose_create_payee_rule"):
+    for name in (
+        "propose_categorize",
+        "propose_create_category",
+        "propose_create_budget",
+        "propose_create_payee_rule",
+        "propose_debt_payoff_strategy",
+        "propose_debt_reserve_goal",
+    ):
         spec = REGISTRY[name]
         assert spec.is_proposal, f"{name} should have is_proposal=True"
 
@@ -225,6 +236,86 @@ async def test_list_budgets_empty(session: AsyncSession, ctx: CallContext):
     handler = REGISTRY["list_budgets"].handler
     r = await handler(session=session, ctx=ctx)
     assert r == {"items": [], "total": 0}
+
+
+# --- debts ------------------------------------------------------------------
+
+async def test_list_debts_empty(session: AsyncSession, ctx: CallContext):
+    handler = REGISTRY["list_debts"].handler
+    r = await handler(session=session, ctx=ctx)
+    assert r == {"debts": []}
+
+
+async def _seed_debt(session, test_workspace, test_user, *, balance, installment, collection_mode="manual"):
+    from datetime import date
+    from decimal import Decimal
+
+    from app.schemas.debt import DebtCreate, DebtPlanCreate
+    from app.services import debt_service
+
+    debt = await debt_service.create_debt(
+        session,
+        test_workspace.id,
+        test_user.id,
+        DebtCreate(
+            kind="loan",
+            creditor_name="Banco Teste",
+            original_principal=Decimal(str(balance)),
+            current_balance=Decimal(str(balance)),
+            currency="BRL",
+            opened_date=date(2026, 1, 1),
+        ),
+    )
+    await debt_service.create_debt_plan(
+        session,
+        debt.id,
+        test_workspace.id,
+        DebtPlanCreate(
+            kind="original_contract",
+            collection_mode=collection_mode,
+            interest_rate=Decimal("0"),
+            installment_amount=Decimal(str(installment)),
+            num_installments=12,
+            first_due_date=date(2026, 2, 1),
+            frequency="monthly",
+            activate=True,
+        ),
+    )
+    return debt
+
+
+async def test_list_debts_returns_seeded_debt(session: AsyncSession, ctx: CallContext, test_workspace, test_user):
+    await _seed_debt(session, test_workspace, test_user, balance=1000, installment=100)
+    handler = REGISTRY["list_debts"].handler
+    r = await handler(session=session, ctx=ctx)
+    assert len(r["debts"]) == 1
+    assert r["debts"][0]["creditor_name"] == "Banco Teste"
+    assert r["debts"][0]["active_plan"]["installment_amount"] == 100.0
+
+
+@pytest.mark.skip(reason="get_income_expenses_report uses PostgreSQL to_char, not portable to SQLite test DB")
+async def test_analyze_debt_payoff_with_no_debts(session: AsyncSession, ctx: CallContext):
+    handler = REGISTRY["analyze_debt_payoff"].handler
+    r = await handler(session=session, ctx=ctx)
+    assert r["active_debts"] == []
+    assert r["reserve_alternative"] is None
+    assert "avalanche" in r["projections"]
+    assert "snowball" in r["projections"]
+
+
+@pytest.mark.skip(reason="get_income_expenses_report uses PostgreSQL to_char, not portable to SQLite test DB")
+async def test_analyze_debt_payoff_projects_with_seeded_debt(
+    session: AsyncSession, ctx: CallContext, test_workspace, test_user
+):
+    await _seed_debt(session, test_workspace, test_user, balance=1000, installment=100)
+    handler = REGISTRY["analyze_debt_payoff"].handler
+    r = await handler(session=session, ctx=ctx, months=3)
+    assert len(r["active_debts"]) == 1
+    assert r["committed_debt_installments"] == 100.0
+    # No transactions were seeded, so income/expenses average to zero and
+    # the conservative surplus floor is zero too.
+    assert r["available_monthly_surplus"] == 0.0
+    assert r["reserve_alternative"] is None
 
 
 async def test_aggregate_payee_filter(
@@ -561,6 +652,35 @@ async def test_propose_create_goal(session: AsyncSession, ctx: CallContext):
     assert r["proposed"]["target_amount"] == 10000.0
     assert r["proposed"]["deadline"] == "2026-12-31"
     assert r["proposed"]["initial_amount"] == 0.0
+
+
+async def test_propose_debt_payoff_strategy_preview(
+    session: AsyncSession, ctx: CallContext, test_workspace, test_user
+):
+    await _seed_debt(session, test_workspace, test_user, balance=1000, installment=100)
+    handler = REGISTRY["propose_debt_payoff_strategy"].handler
+    r = await handler(session=session, ctx=ctx, method="avalanche", extra_monthly_amount=50.0)
+    assert r["kind"] == "update_debt_strategy"
+    assert r["proposed"] == {"method": "avalanche", "extra_monthly_amount": 50.0}
+    assert "applied" not in r
+    assert r["projection"]["method"] == "avalanche"
+
+
+async def test_propose_debt_reserve_goal_defaults_target_to_balance(
+    session: AsyncSession, ctx: CallContext, test_workspace, test_user
+):
+    debt = await _seed_debt(session, test_workspace, test_user, balance=1000, installment=100)
+    handler = REGISTRY["propose_debt_reserve_goal"].handler
+    r = await handler(session=session, ctx=ctx, debt_id=str(debt.id))
+    assert r["kind"] == "create_debt_reserve_goal"
+    assert r["proposed"]["target_amount"] == 1000.0
+    assert "applied" not in r
+
+
+async def test_propose_debt_reserve_goal_unknown_debt(session: AsyncSession, ctx: CallContext):
+    handler = REGISTRY["propose_debt_reserve_goal"].handler
+    r = await handler(session=session, ctx=ctx, debt_id=str(uuid.uuid4()))
+    assert r["error"] == "debt not found"
 
 
 async def test_propose_create_payee_rule_unknown_category(
@@ -997,6 +1117,48 @@ async def test_propose_create_goal_external_apply_writes(
     )).scalar_one()
     assert row.name == "Travel fund"
     assert float(row.target_amount) == 10000.0
+
+
+async def test_propose_debt_payoff_strategy_external_apply_writes(
+    session: AsyncSession, test_user, test_workspace
+):
+    await _seed_debt(session, test_workspace, test_user, balance=1000, installment=100)
+    handler = REGISTRY["propose_debt_payoff_strategy"].handler
+    ctx = CallContext(user_id=test_user.id, external=True)
+
+    result = await handler(
+        session=session, ctx=ctx,
+        method="snowball", extra_monthly_amount=75.0, apply=True,
+    )
+    assert result.get("applied") is True
+
+    from app.services import debt_payoff_strategy_service
+    setting = await debt_payoff_strategy_service.get_or_create_strategy_setting(session, test_workspace.id)
+    assert setting.method == "snowball"
+    assert float(setting.extra_monthly_amount) == 75.0
+
+
+async def test_propose_debt_reserve_goal_external_apply_writes(
+    session: AsyncSession, test_user, test_workspace
+):
+    from sqlalchemy import select
+    from app.models.goal import Goal
+
+    debt = await _seed_debt(session, test_workspace, test_user, balance=1500, installment=100)
+    handler = REGISTRY["propose_debt_reserve_goal"].handler
+    ctx = CallContext(user_id=test_user.id, external=True)
+
+    result = await handler(
+        session=session, ctx=ctx,
+        debt_id=str(debt.id), apply=True,
+    )
+    assert result.get("applied") is True
+
+    row = (await session.execute(
+        select(Goal).where(Goal.id == uuid.UUID(result["id"]))
+    )).scalar_one()
+    assert float(row.target_amount) == 1500.0
+    assert "Banco Teste" in row.name
 
 
 async def test_propose_create_payee_rule_external_apply_writes(
