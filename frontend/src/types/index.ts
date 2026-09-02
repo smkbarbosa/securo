@@ -1378,4 +1378,5 @@ export interface InvoiceFacets {
     overdue: number
     paid: number
     draft: number
+  }
 }
