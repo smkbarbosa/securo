@@ -12,8 +12,8 @@ own migration numbered 078+, renumber THIS migration (update its own
 upstream HEAD instead. Since nothing outside this fork depends on this
 migration's revision id, renumbering it is always safe.
 
-Revision ID: 078
-Revises: 077
+Revision ID: 085
+Revises: 084
 Create Date: 2026-08-31
 """
 
@@ -22,8 +22,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 
-revision = "078"
-down_revision = "077"
+revision = "085"
+down_revision = "084"
 branch_labels = None
 depends_on = None
 
